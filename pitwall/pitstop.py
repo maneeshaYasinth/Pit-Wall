@@ -13,7 +13,7 @@ import copy
 import json
 import re
 import time
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from pathlib import Path
 
 from .tools import compare_with_last_month, cost_by_service, daily_spend_trend, scan_for_debris
@@ -76,7 +76,20 @@ SUPERLATIVE_RE = re.compile(
     r"|\btop\b(?!\s+(\d+|two|three|four|five|six|seven|eight|nine|ten)\b)",  # "top five" is a list, not rank 1
     re.IGNORECASE,
 )
+# "second-largest", "the 3rd biggest", "next highest": the ordinal right before a superlative.
+ORDINAL_RE = re.compile(r"\b(second|third|fourth|fifth|2nd|3rd|4th|5th|next)[\s-]*$", re.IGNORECASE)
+ORDINAL_RANKS = {"second": 2, "2nd": 2, "third": 3, "3rd": 3, "fourth": 4, "4th": 4, "fifth": 5, "5th": 5,
+                 "next": None}
 SENTENCE_RE = re.compile(r"(?<=[.!?])\s+|\n+")
+FALL_RE = re.compile(r"\b(drop(s|ped)?|decrease[sd]?|fell|down|lower|reduced|cheaper)\b", re.IGNORECASE)
+RISE_RE = re.compile(r"\b(spike[sd]?|jump(s|ed)?|rose|increase[sd]?|up|higher|grew)\b", re.IGNORECASE)
+# Phrasal verbs that contain up/down but say nothing about direction ("shut down the cluster").
+NOT_DIRECTION_RE = re.compile(
+    r"\b(shut|shutting|scale|scaling|tear|tearing|turn|turning|wind|winding|break|breaking)\s+down\b"
+    r"|\b(set|setting|spun|spin|spinning|sign|look|clean|cleaning|back|pick|keep|follow|show|open|pop|add|adds|added|adding)\s+up\b"
+    r"|\bup\s+to\b",
+    re.IGNORECASE,
+)
 _ACTS = r"(turning off|shutting down|deleting|stopping|terminating|removing)"
 ACTION_RE = re.compile(
     rf"\b(i'm|i am|i'll|i will|i've|i have|let me)\s+{_ACTS}\b"
@@ -148,7 +161,7 @@ def telemetry_numbers(telemetry: dict) -> set[float]:
     nums: set[float] = set()
 
     def add(v: float) -> None:
-        nums.update({float(v), round(v, 0), round(v, 1)})
+        nums.update({float(v), round(v, 0), round(v, 1), abs(float(v))})
 
     def walk(node, daily: bool = False) -> None:
         if isinstance(node, bool):
@@ -198,6 +211,23 @@ def _ranked_entities(telemetry: dict) -> list[tuple[str, dict, dict]]:
     return out
 
 
+def _find_spans(sentence: str, entities: list[tuple]) -> list[tuple]:
+    """(start, end, item, extra) for every entity mentioned, dropping matches inside longer ones."""
+    spans = []
+    for pattern, item, extra in entities:
+        for m in re.finditer(rf"(?<!\w){re.escape(pattern)}(?!\w)", sentence, re.IGNORECASE):
+            spans.append((m.start(), m.end(), item, extra))
+    # Drop spans inside a longer match ("EC2" inside "EC2 - Other").
+    return [s for s in spans if not any(o[0] <= s[0] and s[1] <= o[1] and (o[1] - o[0]) > (s[1] - s[0])
+                                        for o in spans)]
+
+
+def _nearest(spans: list[tuple], word: re.Match) -> list[tuple]:
+    """All spans at the position closest to a keyword (one mention can map to several items)."""
+    best = min(spans, key=lambda s: min(abs(s[0] - word.end()), abs(word.start() - s[1])))
+    return [s for s in spans if (s[0], s[1]) == (best[0], best[1])]
+
+
 def ranking_errors(text: str, telemetry: dict) -> list[str]:
     """Corrections for sentences that call something the biggest when it isn't rank 1."""
     entities = _ranked_entities(telemetry)
@@ -206,28 +236,159 @@ def ranking_errors(text: str, telemetry: dict) -> list[str]:
         sups = list(SUPERLATIVE_RE.finditer(sentence))
         if not sups:
             continue
-        spans = []
-        for pattern, item, result in entities:
-            for m in re.finditer(rf"(?<!\w){re.escape(pattern)}(?!\w)", sentence, re.IGNORECASE):
-                spans.append((m.start(), m.end(), item, result))
-        # Drop spans inside a longer match ("EC2" inside "EC2 - Other").
-        spans = [s for s in spans if not any(o[0] <= s[0] and s[1] <= o[1] and (o[1] - o[0]) > (s[1] - s[0])
-                                              for o in spans)]
+        spans = _find_spans(sentence, entities)
         if not spans:
             continue
-        sup = sups[0]
-        nearest = min(spans, key=lambda s: min(abs(s[0] - sup.end()), abs(sup.start() - s[1])))
-        start, end = nearest[0], nearest[1]
-        claimed = [s for s in spans if (s[0], s[1]) == (start, end)]
-        if any(s[2].get("rank") == 1 for s in claimed):
+        ordinal = ORDINAL_RE.search(sentence[:sups[0].start()])
+        rank = ORDINAL_RANKS.get(ordinal.group(1).lower()) if ordinal else 1
+        if rank is None:
+            continue  # "the next largest": no fixed rank to check
+        claimed = _nearest(spans, sups[0])
+        start, end = claimed[0][0], claimed[0][1]
+        if any(s[2].get("rank") == rank for s in claimed):
             continue
         result = claimed[0][3]
-        big = result["biggest"]
-        big_name = big.get("service") or big.get("type")
-        big_value = next(v for k, v in big.items() if k.endswith("usd"))
-        errors.append(f"The biggest is {PLAIN_NAMES.get(big_name, big_name)} at {_usd(abs(big_value))}, "
-                      f"not {sentence[start:end]}.")
+        if rank == 1:
+            big = result["biggest"]
+            big_name = big.get("service") or big.get("type")
+            big_value = next(v for k, v in big.items() if k.endswith("usd"))
+            errors.append(f"The biggest is {PLAIN_NAMES.get(big_name, big_name)} at {_usd(abs(big_value))}, "
+                          f"not {sentence[start:end]}.")
+            continue
+        tool = next(t for t, r in telemetry.items() if r is result)
+        list_key, name_key, _, value_key = RANKED_LISTS[tool]
+        actual = next((i for i in result.get(list_key) or [] if i.get("rank") == rank), None)
+        if actual:
+            errors.append(f"Number {rank} is {PLAIN_NAMES.get(actual[name_key], actual[name_key])} at "
+                          f"{_usd(abs(actual[value_key]))}, not {sentence[start:end]}.")
     return errors
+
+
+def _change_entities(telemetry: dict) -> list[tuple[str, dict, None]]:
+    """Items that carry a change_usd: the jump breakdown and the month-over-month comparison."""
+    rows = (telemetry.get("daily_spend_trend", {}).get("jump_breakdown") or []) + \
+        (telemetry.get("compare_with_last_month", {}).get("by_service") or [])
+    out = []
+    for row in rows:
+        name = row["service"]
+        for pattern in [name, PLAIN_NAMES.get(name), *ALIASES.get(name, [])]:
+            if pattern:
+                out.append((pattern, row, None))
+    return out
+
+
+def direction_errors(text: str, telemetry: dict) -> list[str]:
+    """Corrections for sentences that say an item went down when it went up, or the reverse."""
+    entities = _change_entities(telemetry)
+    if not entities:
+        return []
+    errors = []
+    for sentence in SENTENCE_RE.split(_normalise(text)):
+        cleaned = NOT_DIRECTION_RE.sub(lambda m: " " * len(m.group()), sentence)
+        words = [(m, -1) for m in FALL_RE.finditer(cleaned)] + [(m, 1) for m in RISE_RE.finditer(cleaned)]
+        spans = _find_spans(sentence, entities)
+        if not words or not spans:
+            continue
+        for word, sign in words:
+            claimed = _nearest(spans, word)
+            changes = [s[2]["change_usd"] for s in claimed if s[2]["change_usd"]]
+            if changes and all(c * sign < 0 for c in changes):
+                name = sentence[claimed[0][0]:claimed[0][1]]
+                actual, said = ("up", "down") if changes[0] > 0 else ("down", "up")
+                msg = f"{name} went {actual} by {_usd(abs(changes[0]))}, not {said}."
+                if msg not in errors:
+                    errors.append(msg)
+    return errors
+
+
+def attribution_errors(text: str, telemetry: dict) -> list[str]:
+    """Corrections for sentences that pin the whole jump on one service when several moved."""
+    trend = telemetry.get("daily_spend_trend", {})
+    jump, breakdown = trend.get("biggest_jump"), trend.get("jump_breakdown") or []
+    if not jump or len(breakdown) < 2:
+        return []
+    total = jump["increase_usd"]
+    entities = [(p, row, None) for p, row, _ in _change_entities({"daily_spend_trend": trend})]
+    for sentence in SENTENCE_RE.split(_normalise(text)):
+        if not any(abs(a - total) <= max(0.05, 0.02 * abs(total)) for a in dollar_amounts(sentence)):
+            continue
+        named = {s[2]["service"] for s in _find_spans(sentence, entities)}
+        if len(named) == 1:
+            return [f"{_usd(total)} is the total jump across services, not one service: {trend['summary']}"]
+    return []
+
+
+ALL_CLEAR_RE = re.compile(r"nothing to fix|all good|no action needed|nothing to worry|good pace", re.IGNORECASE)
+BOX_BOX_RE = re.compile(r"\bbox,?\s*box\b", re.IGNORECASE)
+# "per month" / "a month" right after an amount, but not "over a month" style spans of time.
+PER_MONTH_RE = re.compile(r"^[^.$\n]{0,25}?(?<!over )(?<!in )(?<!for )(?<!across )\b(per month|a month)\b",
+                          re.IGNORECASE)
+ACTION_SERVICES = {"Amazon Elastic Container Service for Kubernetes", "EC2 - Other",
+                   "Amazon Elastic Compute Cloud - Compute"}
+
+
+def needs_action(telemetry: dict) -> str | None:
+    """The rank-1 thing the user should act on, as text, or None when the data really is all clear."""
+    debris = telemetry.get("scan_for_debris", {}).get("items") or []
+    if debris:
+        top = max(debris, key=lambda i: i["est_monthly_usd"])
+        return f"{top['type']} {top['id']} at about {_usd(top['est_monthly_usd'])} a month"
+    breakdown = telemetry.get("daily_spend_trend", {}).get("jump_breakdown") or []
+    if breakdown and breakdown[0]["change_usd"] >= 1:
+        top = breakdown[0]
+        return f"{_plain(top['service'])}, up {_usd(top['change_usd'])} a day"
+    services = telemetry.get("cost_by_service", {}).get("services") or []
+    if services:
+        top = max(services, key=lambda s: s["usd"])
+        if top["service"] in ACTION_SERVICES and top["usd"] >= 5:
+            return f"{_plain(top['service'])} at {_usd(top['usd'])} over the last {_days(telemetry)} days"
+    cmp = telemetry.get("compare_with_last_month", {})
+    rows = cmp.get("by_service") or []
+    if rows and cmp.get("this_month_total_usd", 0) - cmp.get("last_month_total_usd", 0) >= 5:
+        top = max(rows, key=lambda r: abs(r["change_usd"]))
+        direction = "up" if top["change_usd"] > 0 else "down"
+        return f"{_plain(top['service'])}, {direction} {_usd(abs(top['change_usd']))} on last month"
+    return None
+
+
+def _days(telemetry: dict) -> int:
+    period = telemetry.get("cost_by_service", {}).get("period", "")
+    try:
+        start, end = (date.fromisoformat(p.strip()) for p in period.split(" to "))
+        return (end - start).days
+    except ValueError:
+        return 30
+
+
+def tone_errors(text: str, telemetry: dict) -> list[tuple[str, str]]:
+    """'All clear' when there's something to fix, and a missing Box, box line."""
+    todo = needs_action(telemetry)
+    if not todo:
+        return []
+    failures = []
+    if ALL_CLEAR_RE.search(text):
+        failures.append(("tone", f"There IS something to fix: {todo}. End with a Box, box: action for it."))
+    if not BOX_BOX_RE.search(text):
+        failures.append(("no_action", f"End with a 'Box, box:' line telling the user what to do about {todo}."))
+    return failures
+
+
+def period_errors(text: str, telemetry: dict) -> list[str]:
+    """Cost Explorer totals cover a date range; calling them 'per month' is wrong."""
+    cost = telemetry.get("cost_by_service", {})
+    if not cost.get("services"):
+        return []
+    period_figures = [s["usd"] for s in cost["services"]] + [cost.get("total_usd", 0)]
+    monthly = [i["est_monthly_usd"] for i in telemetry.get("scan_for_debris", {}).get("items") or []]
+    monthly.append(telemetry.get("scan_for_debris", {}).get("est_monthly_total_usd", -1))
+    for m in DOLLAR_RE.finditer(text):
+        amount = float(m.group(1).replace(",", ""))
+        if any(abs(amount - v) <= 0.005 for v in monthly):
+            continue  # debris estimates really are monthly
+        if any(abs(amount - v) <= 0.05 for v in period_figures) and PER_MONTH_RE.search(text[m.end():]):
+            return [f"These figures cover {cost['period']}, not per month. "
+                    f"Say 'over the last {_days(telemetry)} days'."]
+    return []
 
 
 def check(text: str, telemetry: dict) -> list[tuple[str, str]]:
@@ -239,6 +400,13 @@ def check(text: str, telemetry: dict) -> list[tuple[str, str]]:
                          + ". Use only numbers from the TELEMETRY."))
     for err in ranking_errors(text, telemetry):
         failures.append(("ranking", err))
+    for err in direction_errors(text, telemetry):
+        failures.append(("direction", err))
+    for err in attribution_errors(text, telemetry):
+        failures.append(("attribution", err))
+    failures += tone_errors(text, telemetry)
+    for err in period_errors(text, telemetry):
+        failures.append(("period", err))
     if claims_action(text):
         failures.append(("action", "You are read-only; tell the user how to do it themselves."))
     return failures
@@ -266,6 +434,14 @@ def _trend_lines(r: dict) -> tuple[list[str], str]:
     jump = r.get("biggest_jump")
     if not jump:
         return ["Lap times are steady: no day-over-day jump in the data."], ""
+    breakdown = r.get("jump_breakdown") or []
+    if r.get("summary") and breakdown:
+        top = breakdown[0]
+        return (
+            [r["summary"]],
+            f"Box, box: {_plain(top['service'])} is the biggest riser. Open Cost Explorer, filter to "
+            f"{top['service']} for {jump['date']}, and remove anything launched that day you no longer need.",
+        )
     return (
         [f"Biggest jump was on {jump['date']}: daily spend went from {_usd(jump['from_usd'])} "
          f"to {_usd(jump['to_usd'])}, up {_usd(jump['increase_usd'])} a day."],

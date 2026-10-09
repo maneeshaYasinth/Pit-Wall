@@ -17,6 +17,7 @@ from botocore.exceptions import BotoCoreError, ClientError, NoCredentialsError
 from strands import tool
 
 from . import demo_data
+from .attribution import jump_breakdown, jump_summary
 
 CE_REGION = "us-east-1"  # Cost Explorer is a global API served from us-east-1
 CACHE_TTL_SECONDS = 15 * 60  # Cost Explorer charges per request; CE data is ~daily anyway
@@ -157,9 +158,31 @@ def daily_spend_trend(days: int = 14) -> dict:
         daily = [
             {"date": p["TimePeriod"]["Start"], "usd": _amount(p["Total"])} for p in resp["ResultsByTime"]
         ]
-        return _with_biggest_jump(daily)
+        result = _with_biggest_jump(daily)
+        if result["biggest_jump"]:
+            try:
+                result.update(_jump_attribution(result["biggest_jump"]))
+            except Exception:  # noqa: BLE001
+                pass  # the trend is still useful without the per-service split
+        return result
     except Exception as exc:  # noqa: BLE001
         return friendly_error(exc)
+
+
+def _jump_attribution(jump: dict) -> dict:
+    """Per-service cost on the day before the jump vs the jump day: one DAILY Cost Explorer call."""
+    jump_day = date.fromisoformat(jump["date"])
+    resp = _ce().get_cost_and_usage(
+        TimePeriod={"Start": (jump_day - timedelta(days=1)).isoformat(), "End": (jump_day + timedelta(days=1)).isoformat()},
+        Granularity="DAILY",
+        Metrics=["UnblendedCost"],
+        GroupBy=[{"Type": "DIMENSION", "Key": "SERVICE"}],
+    )
+    by_day: dict[str, dict[str, float]] = {}
+    for p in resp["ResultsByTime"]:
+        by_day[p["TimePeriod"]["Start"]] = {g["Keys"][0]: _amount(g["Metrics"]) for g in p["Groups"]}
+    breakdown = jump_breakdown(by_day.get((jump_day - timedelta(days=1)).isoformat(), {}), by_day.get(jump["date"], {}))
+    return {"jump_breakdown": breakdown, "summary": jump_summary(jump, breakdown)}
 
 
 def _with_biggest_jump(daily: list[dict]) -> dict:

@@ -10,6 +10,8 @@ from __future__ import annotations
 
 from datetime import date, timedelta
 
+from .attribution import jump_breakdown, jump_summary
+
 SPIKE_DAYS_AGO = 6  # the day the EKS lab went up
 
 
@@ -23,6 +25,22 @@ def _lab(days_ago: int) -> float:
     return 2.40 + 1.18 + 1.00 if days_ago <= SPIKE_DAYS_AGO else 0.0
 
 
+def _by_service(days_ago: int) -> dict[str, float]:
+    # Same rates as _baseline + _lab, split per service (the baseline wobble sits in S3).
+    services = {
+        "Amazon Simple Storage Service": 0.14 + (days_ago % 3) * 0.03,
+        "Amazon CloudFront": 0.09,
+        "AWS Lambda": 0.05,
+        "Amazon CloudWatch": 0.06,
+        "Amazon Route 53": 0.04,
+    }
+    if days_ago <= SPIKE_DAYS_AGO:
+        services["Amazon Elastic Container Service for Kubernetes"] = 2.40
+        services["EC2 - Other"] = 1.18  # NAT gateway hours + data processing
+        services["Amazon Elastic Compute Cloud - Compute"] = 1.00
+    return services
+
+
 def daily_spend_trend(days: int) -> dict:
     today = date.today()
     daily = []
@@ -34,7 +52,13 @@ def daily_spend_trend(days: int) -> dict:
         delta = round(cur["usd"] - prev["usd"], 2)
         if jump is None or delta > jump["increase_usd"]:
             jump = {"date": cur["date"], "from_usd": prev["usd"], "to_usd": cur["usd"], "increase_usd": delta}
-    return {"daily": daily, "biggest_jump": jump if jump and jump["increase_usd"] > 0 else None, "demo": True}
+    jump = jump if jump and jump["increase_usd"] > 0 else None
+    result = {"daily": daily, "biggest_jump": jump, "demo": True}
+    if jump:
+        days_ago = (today - date.fromisoformat(jump["date"])).days
+        result["jump_breakdown"] = jump_breakdown(_by_service(days_ago + 1), _by_service(days_ago))
+        result["summary"] = jump_summary(jump, result["jump_breakdown"])
+    return result
 
 
 def cost_by_service(days: int) -> dict:

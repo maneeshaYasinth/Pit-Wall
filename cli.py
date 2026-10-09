@@ -54,7 +54,7 @@ def main() -> None:
         try:
             if prefetch:
                 r = pitstop.ask(agent, q)
-                tag = "✅ numbers verified" if r["verified"] else "🛟 safe mode" if r["fallback"] else ""
+                tag = "✅ checked against your data" if r["verified"] else "🛟 safe mode" if r["fallback"] else ""
                 print(r["text"] + (f"\n[{tag}]" if tag else ""), end="")
             else:
                 agent(q)

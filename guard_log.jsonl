@@ -1,4 +1,0 @@
-{"ts": "2026-10-09T05:21:00.269463+00:00", "question": "Where is my AWS money going this month?", "tools": ["cost_by_service"], "first_try_passed": false, "failures": ["number"], "fallback": true, "secs": 33.2}
-{"ts": "2026-10-09T05:21:33.427335+00:00", "question": "Where is my AWS money going this month?", "tools": ["cost_by_service"], "first_try_passed": false, "failures": ["ranking"], "fallback": true, "secs": 24.7}
-{"ts": "2026-10-09T05:21:58.083869+00:00", "question": "Where is my AWS money going this month?", "tools": ["cost_by_service"], "first_try_passed": true, "failures": [], "fallback": false, "secs": 10.8}
-{"ts": "2026-10-09T05:33:54.762571+00:00", "question": "Why did my bill jump this week?", "tools": ["daily_spend_trend", "cost_by_service"], "first_try_passed": true, "failures": [], "fallback": false, "secs": 47.0}

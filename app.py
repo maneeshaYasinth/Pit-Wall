@@ -13,6 +13,7 @@ import streamlit as st
 
 from pitwall import pitstop
 from pitwall.agent import build_agent, explain_model_error, prefetch_enabled
+from pitwall.render import md_safe
 from pitwall.tools import is_demo, radio_check
 
 FEEDBACK_FILE = Path("feedback.jsonl")
@@ -54,7 +55,7 @@ if "radio" not in st.session_state:
     with st.spinner("Radio check…"):
         st.session_state.radio = radio_check()
 ok, msg = st.session_state.radio
-st.markdown(f'<div class="radio {"" if ok else "bad"}">📻 {msg}</div>', unsafe_allow_html=True)
+st.markdown(f'<div class="radio {"" if ok else "bad"}">📻 {md_safe(msg)}</div>', unsafe_allow_html=True)
 if not ok:
     st.info("You can still try Pit Wall with sample data: restart with `PITWALL_DEMO=1 streamlit run app.py`.")
     st.stop()
@@ -132,11 +133,12 @@ if not st.session_state.history:
 
 for i, turn in enumerate(st.session_state.history):
     with st.chat_message(turn["role"], avatar="📻" if turn["role"] == "assistant" else "🏎️"):
-        st.markdown(turn["text"])
+        st.markdown(md_safe(turn["text"]))
         if turn["role"] == "assistant":
             chips = "".join(f'<span class="chip">{TOOL_LABELS.get(t, t)}</span>' for t in turn.get("tools", []))
             if turn.get("verified"):
-                chips += '<span class="chip">✅ numbers verified</span>'
+                chips += ('<span class="chip" title="Every dollar figure, the top item and up/down claims '
+                          'were checked against the telemetry.">✅ checked against your data</span>')
             elif turn.get("fallback"):
                 chips += '<span class="chip">🛟 safe mode</span>'
             chips += f'<span class="chip">⏲️ {turn.get("secs")}s</span>'

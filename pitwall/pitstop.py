@@ -327,28 +327,58 @@ ACTION_SERVICES = {"Amazon Elastic Container Service for Kubernetes", "EC2 - Oth
                    "Amazon Elastic Compute Cloud - Compute"}
 
 
-def needs_action(telemetry: dict) -> str | None:
-    """The rank-1 thing the user should act on, as text, or None when the data really is all clear."""
+def action_item(telemetry: dict) -> dict | None:
+    """The rank-1 thing to act on: name, plain name, amount (with its time unit) and a one-line text."""
     debris = telemetry.get("scan_for_debris", {}).get("items") or []
     if debris:
         top = max(debris, key=lambda i: i["est_monthly_usd"])
-        return f"{top['type']} {top['id']} at about {_usd(top['est_monthly_usd'])} a month"
+        amount = f"{_usd(top['est_monthly_usd'])} a month"
+        return {"name": f"{top['type']} {top['id']}", "plain": top["detail"], "amount": amount,
+                "text": f"{top['type']} {top['id']} at about {amount}"}
     breakdown = telemetry.get("daily_spend_trend", {}).get("jump_breakdown") or []
     if breakdown and breakdown[0]["change_usd"] >= 1:
         top = breakdown[0]
-        return f"{_plain(top['service'])}, up {_usd(top['change_usd'])} a day"
+        amount = f"{_usd(top['change_usd'])} a day more"
+        return {"name": top["service"], "plain": PLAIN_NAMES.get(top["service"], top["service"]), "amount": amount,
+                "text": f"{_plain(top['service'])}, up {_usd(top['change_usd'])} a day"}
     services = telemetry.get("cost_by_service", {}).get("services") or []
     if services:
         top = max(services, key=lambda s: s["usd"])
         if top["service"] in ACTION_SERVICES and top["usd"] >= 5:
-            return f"{_plain(top['service'])} at {_usd(top['usd'])} over the last {_days(telemetry)} days"
+            amount = f"{_usd(top['usd'])} over the last {_days(telemetry)} days"
+            return {"name": top["service"], "plain": PLAIN_NAMES.get(top["service"], top["service"]),
+                    "amount": amount, "text": f"{_plain(top['service'])} at {amount}"}
     cmp = telemetry.get("compare_with_last_month", {})
     rows = cmp.get("by_service") or []
     if rows and cmp.get("this_month_total_usd", 0) - cmp.get("last_month_total_usd", 0) >= 5:
         top = max(rows, key=lambda r: abs(r["change_usd"]))
         direction = "up" if top["change_usd"] > 0 else "down"
-        return f"{_plain(top['service'])}, {direction} {_usd(abs(top['change_usd']))} on last month"
+        amount = f"{_usd(abs(top['change_usd']))} {direction} on last month"
+        return {"name": top["service"], "plain": PLAIN_NAMES.get(top["service"], top["service"]), "amount": amount,
+                "text": f"{_plain(top['service'])}, {direction} {_usd(abs(top['change_usd']))} on last month"}
     return None
+
+
+def needs_action(telemetry: dict) -> str | None:
+    """The rank-1 thing the user should act on, as text, or None when the data really is all clear."""
+    item = action_item(telemetry)
+    return item["text"] if item else None
+
+
+def verdict_lines(telemetry: dict) -> str:
+    """Tell the model up front whether there's something to fix, and how to word cost periods."""
+    item = action_item(telemetry)
+    if item:
+        lines = [f"VERDICT: ACTION NEEDED. Top item: {item['name']} ({item['plain']}) at {item['amount']}. "
+                 "Do not say spend is fine. End with exactly one line starting 'Box, box:' "
+                 "telling the user what to do about it."]
+    else:
+        lines = ["VERDICT: ALL CLEAR. Say spend looks fine; no Box, box line needed."]
+    cost = telemetry.get("cost_by_service", {})
+    if cost.get("period"):
+        lines.append(f"Figures from cost_by_service cover {cost['period']}. "
+                     f"Say 'over the last {_days(telemetry)} days', never 'per month'.")
+    return "\n".join(lines)
 
 
 def _days(telemetry: dict) -> int:
@@ -539,7 +569,8 @@ def ask(agent, question: str) -> dict:
             return {"text": error_text(result), "tools": tools, "verified": False, "fallback": False}
 
     before = len(agent.messages)
-    prompt = f"{question}\n\n{TELEMETRY_HEADER}\n{json.dumps(telemetry, separators=(',', ':'))}"
+    prompt = (f"{question}\n\n{verdict_lines(telemetry)}\n\n"
+              f"{TELEMETRY_HEADER}\n{json.dumps(telemetry, separators=(',', ':'))}")
     text = str(agent(prompt)).strip()
     failures = check(text, telemetry)
     first_try_passed = not failures

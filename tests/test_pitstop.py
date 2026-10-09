@@ -323,3 +323,42 @@ def test_ranking_guard_handles_ordinals(text, ok):
     assert (errors == []) is ok
     if not ok:
         assert errors == ["Number 2 is NAT gateways, EBS volumes and data transfer at $7.08, not S3."]
+
+
+# --------------------------------------------------------------------------- #
+# VERDICT line and system prompt
+# --------------------------------------------------------------------------- #
+
+QUIET = {"cost_by_service": {"period": "2026-09-10 to 2026-10-10", "total_usd": 1.2,
+                             "services": [{"service": "Amazon Simple Storage Service", "usd": 1.2, "rank": 1}]}}
+
+
+def test_verdict_action_needed_for_demo_data():
+    v = pitstop.verdict_lines(cost_telemetry())
+    assert v.startswith("VERDICT: ACTION NEEDED. Top item: Amazon Elastic Container Service for Kubernetes "
+                        "(EKS (Kubernetes control plane)) at $14.40 over the last 30 days.")
+    assert "End with exactly one line starting 'Box, box:'" in v
+    assert "Say 'over the last 30 days', never 'per month'." in v
+    for q in ["Why did my bill jump?", "What did I forget to turn off?", "More than last month?"]:
+        assert pitstop.verdict_lines(pitstop.annotate(pitstop.fetch(pitstop.pick_tools(q)))).startswith(
+            "VERDICT: ACTION NEEDED.")
+
+
+def test_verdict_all_clear_for_quiet_account():
+    v = pitstop.verdict_lines(QUIET)
+    assert v.splitlines()[0] == "VERDICT: ALL CLEAR. Say spend looks fine; no Box, box line needed."
+    assert "cover 2026-09-10 to 2026-10-10" in v
+
+
+def test_verdict_sent_before_telemetry():
+    agent = FakeAgent(["Copy. NAT gateway, about $32.85 a month. Box, box: delete it in the VPC console."])
+    pitstop.ask(agent, "What did I forget to turn off?")
+    prompt = agent.prompts[0]
+    assert prompt.index("VERDICT: ACTION NEEDED. Top item: NAT gateway") < prompt.index(pitstop.TELEMETRY_HEADER)
+
+
+def test_system_prompt_has_no_canned_all_clear():
+    from pitwall.agent import SYSTEM_PROMPT
+
+    assert "nothing to fix" not in SYSTEM_PROMPT.lower()
+    assert "Only when the VERDICT says ALL CLEAR" in SYSTEM_PROMPT

@@ -10,6 +10,10 @@ It is **read-only**. It never creates, changes or deletes anything in your accou
 
 Built with [Strands Agents](https://strandsagents.com), Amazon Bedrock, AWS Cost Explorer and Streamlit.
 
+![Pit Wall web UI: radio check on demo telemetry and suggested questions](assests/img1.png)
+
+▶️ [Watch the demo video](assests/vd1.mp4)
+
 ## Quick start
 
 ```bash
